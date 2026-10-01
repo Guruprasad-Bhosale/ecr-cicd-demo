@@ -9,8 +9,11 @@ on:
       - main
 
 env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
-  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  AWS_REGION: ${{ secrets.AWS_REGION || 'ap-south-1' }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY || 'dvops-flask-app' }}
+
+permissions:
+  contents: read
 
 jobs:
 
@@ -52,17 +55,24 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME || 'arn:aws:iam::058264128244:role/github-actions-ecr-role' }}
+          role-session-name: GitHubActions-ECR-Deployment
+          aws-region: ${{ secrets.AWS_REGION || 'ap-south-1' }}
+
+      - name: Verify AWS Identity
+        run: |
+          aws sts get-caller-identity
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -75,16 +85,16 @@ jobs:
           DOCKER_BUILDKIT: 1
         run: |
           docker build \
-            -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
-            -t $REGISTRY/$ECR_REPOSITORY:latest .
+            -t $REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG \
+            -t $REGISTRY/${{ env.ECR_REPOSITORY }}:latest .
 
       - name: Push SHA-tagged and latest images to ECR
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $REGISTRY/$ECR_REPOSITORY:latest
+          docker push $REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
+          docker push $REGISTRY/${{ env.ECR_REPOSITORY }}:latest
 
       - name: Display image information
         env:
@@ -93,6 +103,6 @@ jobs:
         run: |
           echo "Image successfully built and pushed:"
           echo "Registry: $REGISTRY"
-          echo "Repository: $ECR_REPOSITORY"
+          echo "Repository: ${{ env.ECR_REPOSITORY }}"
           echo "SHA Tag: $IMAGE_TAG"
           echo "Latest Tag: latest"
