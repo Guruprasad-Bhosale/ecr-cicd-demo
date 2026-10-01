@@ -2,7 +2,7 @@
 
 ## 1. Scope & Verification Strategy
 
-This document specifies the validation procedures for live runtime observation, smoke testing, CloudWatch log auditing, and failure/recovery checks for the Flask application hosted on AWS ECS Fargate.
+This document specifies the validation procedures for live runtime observation, smoke testing, CloudWatch log auditing, and failure/recovery checks for the Flask application hosted on AWS ECS Fargate, triggered either through automated GitHub Actions CD or manual administrative validation.
 
 ---
 
@@ -28,7 +28,7 @@ curl -i http://<ALB_DNS_NAME>/health
 
 ### Test 3: Unhandled Route (404 Behavior)
 ```bash
-curl -i http://<ALB_DNS_NAME>/non-existent-route
+curl -i http://<ALB_DNS_NAME>/non-existent-endpoint
 ```
 - **Expected Status**: `HTTP/1.1 404 NOT FOUND`
 
@@ -57,19 +57,34 @@ aws logs tail /ecs/flask-app --region ap-south-1 --follow
 
 ## 4. Rollback & Disaster Recovery Procedures
 
-### Rollback via Immutable Image Digest / Commit SHA
-To revert to a prior known-good deployment:
+### Rollback via Previous ECS Task Definition Revision
+To immediately revert to the prior known-good task definition revision:
 
 ```bash
-# 1. Update task definition with previous immutable ECR image tag
+# 1. Update ECS service to previous task definition revision
 aws ecs update-service \
   --cluster flask-app-cluster \
   --service flask-app-service \
-  --force-new-deployment \
+  --task-definition flask-app-task:<PREVIOUS_REVISION> \
   --region ap-south-1
+
+# 2. Wait for rollback deployment stability
+aws ecs wait services-stable \
+  --cluster flask-app-cluster \
+  --service flask-app-service \
+  --region ap-south-1
+```
+
+### Rollback via Immutable Image Digest
+To deploy a previous immutable container image digest:
+
+```bash
+# Update task definition container image with previous digest
+# dvops-flask-app@sha256:<PREVIOUS_DIGEST>
 ```
 
 ### ECS Rolling Update Guarantee:
 - `minimumHealthyPercent`: `100`
 - `maximumPercent`: `200`
-- The ALB will route traffic to the newly created task only after it passes 2 consecutive `/health` checks, ensuring zero downtime during rollbacks and deployments.
+- The ALB will route traffic to the newly created task only after it passes 2 consecutive `/health` checks, ensuring zero downtime during rollbacks and continuous deployments.
+

@@ -1,4 +1,4 @@
-name: CI/CD - Test, Build, Push to AWS ECR
+name: CI/CD - Test, Build, Push to ECR & Deploy to ECS Fargate
 
 on:
   push:
@@ -8,20 +8,30 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
-  AWS_REGION: ${{ secrets.AWS_REGION || 'ap-south-1' }}
-  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY || 'dvops-flask-app' }}
+  AWS_REGION: ${{ vars.AWS_REGION || secrets.AWS_REGION || 'ap-south-1' }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || secrets.ECR_REPOSITORY || 'dvops-flask-app' }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER || secrets.ECS_CLUSTER || 'flask-app-cluster' }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE || secrets.ECS_SERVICE || 'flask-app-service' }}
+  ECS_TASK_FAMILY: ${{ vars.ECS_TASK_FAMILY || secrets.ECS_TASK_FAMILY || 'flask-app-task' }}
+  CONTAINER_NAME: ${{ vars.CONTAINER_NAME || secrets.CONTAINER_NAME || 'flask-app' }}
+  ALB_NAME: ${{ vars.ALB_NAME || secrets.ALB_NAME || 'flask-app-alb' }}
+  AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME || secrets.AWS_ROLE_TO_ASSUME || 'arn:aws:iam::058264128244:role/github-actions-ecr-role' }}
 
 permissions:
   contents: read
 
 jobs:
 
-  # ---------------------------------------
-  # JOB 1: TEST & LINT
-  # ---------------------------------------
+  # -------------------------------------------------------------
+  # JOB 1: TEST & LINT (Quality Gate)
+  # -------------------------------------------------------------
   test:
-    name: Run Tests and Linting
+    name: 1. Quality Gate - Lint & Unit Tests
     runs-on: ubuntu-latest
 
     steps:
@@ -43,21 +53,26 @@ jobs:
         run: |
           ruff check .
 
-      - name: Run pytest
+      - name: Run pytest test suite
         run: |
           pytest test_app.py -v
 
-  # ---------------------------------------
-  # JOB 2: BUILD AND PUSH TO AWS ECR
-  # ---------------------------------------
+  # -------------------------------------------------------------
+  # JOB 2: BUILD & PUSH IMMUTABLE IMAGE TO ECR
+  # -------------------------------------------------------------
   build-and-push:
-    name: Build Docker Image and Push to ECR
+    name: 2. Build & Publish Immutable ECR Image
     runs-on: ubuntu-latest
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       id-token: write
       contents: read
+    outputs:
+      image_uri: ${{ steps.set-output.outputs.image_uri }}
+      image_tag: ${{ steps.set-output.outputs.image_tag }}
+      image_digest: ${{ steps.set-output.outputs.image_digest }}
+      registry: ${{ steps.login-ecr.outputs.registry }}
 
     steps:
       - name: Checkout source code
@@ -66,12 +81,13 @@ jobs:
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME || 'arn:aws:iam::058264128244:role/github-actions-ecr-role' }}
-          role-session-name: GitHubActions-ECR-Deployment
-          aws-region: ${{ secrets.AWS_REGION || 'ap-south-1' }}
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          role-session-name: GitHubActions-ECR-BuildPush
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Verify AWS Identity
         run: |
+          echo "=== AWS Identity Verification ==="
           aws sts get-caller-identity
 
       - name: Login to Amazon ECR
@@ -84,6 +100,7 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}
           DOCKER_BUILDKIT: 1
         run: |
+          echo "Building Docker image with SHA tag: $IMAGE_TAG"
           docker build \
             -t $REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG \
             -t $REGISTRY/${{ env.ECR_REPOSITORY }}:latest .
@@ -93,16 +110,288 @@ jobs:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
+          echo "Pushing immutable SHA tag: $REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG"
           docker push $REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
+          echo "Pushing convenience latest tag: $REGISTRY/${{ env.ECR_REPOSITORY }}:latest"
           docker push $REGISTRY/${{ env.ECR_REPOSITORY }}:latest
 
-      - name: Display image information
+      - name: Query ECR Image Digest & Set Outputs
+        id: set-output
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          echo "Image successfully built and pushed:"
+          DIGEST=$(aws ecr describe-images \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-ids imageTag=$IMAGE_TAG \
+            --region ${{ env.AWS_REGION }} \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)
+          
+          IMAGE_URI="$REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG"
+          
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "image_digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+          echo "=== Immutable Image Published ==="
           echo "Registry: $REGISTRY"
           echo "Repository: ${{ env.ECR_REPOSITORY }}"
           echo "SHA Tag: $IMAGE_TAG"
-          echo "Latest Tag: latest"
+          echo "ECR Digest: $DIGEST"
+          echo "Deploy Image URI: $IMAGE_URI"
+
+  # -------------------------------------------------------------
+  # JOB 3: REGISTER TASK DEFINITION & DEPLOY TO ECS FARGATE
+  # -------------------------------------------------------------
+  deploy-ecs:
+    name: 3. Deploy to AWS ECS Fargate
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      task_definition_arn: ${{ steps.register-task-def.outputs.task_def_arn }}
+      task_revision: ${{ steps.register-task-def.outputs.task_revision }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          role-session-name: GitHubActions-ECS-Deployment
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS Identity
+        run: |
+          echo "=== AWS Identity Verification ==="
+          aws sts get-caller-identity
+
+      - name: Fetch current ECS Task Definition
+        id: fetch-task-def
+        run: |
+          echo "Fetching active task definition for family: ${{ env.ECS_TASK_FAMILY }}"
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_TASK_FAMILY }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskDefinition' > current-task-def.json
+
+      - name: Update Container Image to Immutable SHA URI
+        id: prepare-task-def
+        env:
+          NEW_IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+          TARGET_CONTAINER: ${{ env.CONTAINER_NAME }}
+        run: |
+          python - << 'EOF'
+          import json
+          import os
+
+          with open('current-task-def.json', 'r') as f:
+              td = json.load(f)
+
+          target_container = os.environ['TARGET_CONTAINER']
+          new_image = os.environ['NEW_IMAGE_URI']
+
+          updated = False
+          for container in td.get('containerDefinitions', []):
+              if container.get('name') == target_container:
+                  print(f"Updating image for container '{target_container}' from '{container.get('image')}' to '{new_image}'")
+                  container['image'] = new_image
+                  updated = True
+
+          if not updated:
+              raise ValueError(f"Container '{target_container}' not found in task definition")
+
+          # Remove read-only / metadata attributes not accepted by register-task-definition
+          disallowed_keys = [
+              'taskDefinitionArn',
+              'revision',
+              'status',
+              'requiresAttributes',
+              'compatibilities',
+              'registeredAt',
+              'registeredBy'
+          ]
+          for key in disallowed_keys:
+              td.pop(key, None)
+
+          with open('new-task-def.json', 'w') as f:
+              json.dump(td, f, indent=2)
+
+          print("Generated clean new-task-def.json for registration.")
+          EOF
+
+      - name: Register new ECS Task Definition revision
+        id: register-task-def
+        run: |
+          echo "Registering new ECS task definition revision..."
+          REG_OUTPUT=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-def.json \
+            --region ${{ env.AWS_REGION }})
+          
+          TASK_DEF_ARN=$(echo "$REG_OUTPUT" | jq -r '.taskDefinition.taskDefinitionArn')
+          TASK_REVISION=$(echo "$REG_OUTPUT" | jq -r '.taskDefinition.revision')
+          
+          echo "task_def_arn=$TASK_DEF_ARN" >> "$GITHUB_OUTPUT"
+          echo "task_revision=$TASK_REVISION" >> "$GITHUB_OUTPUT"
+          
+          echo "=== Registered Task Definition Revision ==="
+          echo "ARN: $TASK_DEF_ARN"
+          echo "Revision: $TASK_REVISION"
+
+      - name: Update ECS Service with new Task Definition
+        id: update-service
+        run: |
+          TASK_DEF_ARN="${{ steps.register-task-def.outputs.task_def_arn }}"
+          echo "Updating ECS service ${{ env.ECS_SERVICE }} in cluster ${{ env.ECS_CLUSTER }} to $TASK_DEF_ARN..."
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition "$TASK_DEF_ARN" \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for ECS Service Stability
+        run: |
+          echo "Waiting for ECS service to reach steady state (aws ecs wait services-stable)..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --region ${{ env.AWS_REGION }}
+          echo "ECS service deployment stabilized successfully!"
+
+      - name: Verify Deployment Details
+        run: |
+          echo "=== ECS Service Status After Deployment ==="
+          aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'services[0].{Desired:desiredCount,Running:runningCount,Pending:pendingCount,Deployments:deployments}' \
+            --output json
+
+  # -------------------------------------------------------------
+  # JOB 4: LIVE ALB SMOKE TESTS
+  # -------------------------------------------------------------
+  smoke-test:
+    name: 4. Live Runtime ALB Smoke Tests
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy-ecs]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          role-session-name: GitHubActions-SmokeTest
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Discover ALB Public DNS
+        id: get-alb
+        run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names ${{ env.ALB_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+          
+          if [ -z "$ALB_DNS" ] || [ "$ALB_DNS" = "None" ]; then
+            echo "ERROR: Failed to retrieve ALB DNS for ${{ env.ALB_NAME }}"
+            exit 1
+          fi
+          
+          echo "alb_dns=$ALB_DNS" >> "$GITHUB_OUTPUT"
+          echo "Discovered ALB Public DNS: $ALB_DNS"
+
+      - name: Execute Live HTTP Smoke Tests
+        env:
+          ALB_DNS: ${{ steps.get-alb.outputs.alb_dns }}
+        run: |
+          BASE_URL="http://${ALB_DNS}"
+          echo "=== Starting Live Smoke Tests against $BASE_URL ==="
+
+          # Test 1: Root Greeting Endpoint (GET / -> 200 OK)
+          echo "--- Test 1: Root Greeting Endpoint (GET /) ---"
+          ROOT_RESP=$(curl -s -w "\nHTTP_STATUS:%{http_code}" "$BASE_URL/")
+          ROOT_BODY=$(echo "$ROOT_RESP" | sed '$d')
+          ROOT_STATUS=$(echo "$ROOT_RESP" | tail -n1 | sed 's/HTTP_STATUS://')
+          echo "Status: $ROOT_STATUS"
+          echo "Body: $ROOT_BODY"
+          if [ "$ROOT_STATUS" != "200" ]; then
+            echo "FAILED: Root endpoint returned status $ROOT_STATUS, expected 200"
+            exit 1
+          fi
+          if ! echo "$ROOT_BODY" | grep -q "Hello from E10 CI/CD Pipeline!"; then
+            echo "FAILED: Root endpoint body did not contain expected text"
+            exit 1
+          fi
+
+          # Test 2: Health Check Contract Endpoint (GET /health -> 200 OK {"status":"healthy"})
+          echo "--- Test 2: Health Check Contract Endpoint (GET /health) ---"
+          HEALTH_RESP=$(curl -s -w "\nHTTP_STATUS:%{http_code}" "$BASE_URL/health")
+          HEALTH_BODY=$(echo "$HEALTH_RESP" | sed '$d')
+          HEALTH_STATUS=$(echo "$HEALTH_RESP" | tail -n1 | sed 's/HTTP_STATUS://')
+          echo "Status: $HEALTH_STATUS"
+          echo "Body: $HEALTH_BODY"
+          if [ "$HEALTH_STATUS" != "200" ]; then
+            echo "FAILED: Health endpoint returned status $HEALTH_STATUS, expected 200"
+            exit 1
+          fi
+          if ! echo "$HEALTH_BODY" | grep -q '"status":\s*"healthy"'; then
+            echo "FAILED: Health endpoint response did not match expected JSON contract"
+            exit 1
+          fi
+
+          # Test 3: Unhandled Route (GET /non-existent-endpoint -> 404 NOT FOUND)
+          echo "--- Test 3: Unhandled Route (GET /non-existent-endpoint) ---"
+          NOT_FOUND_RESP=$(curl -s -w "\nHTTP_STATUS:%{http_code}" "$BASE_URL/non-existent-endpoint")
+          NOT_FOUND_STATUS=$(echo "$NOT_FOUND_RESP" | tail -n1 | sed 's/HTTP_STATUS://')
+          echo "Status: $NOT_FOUND_STATUS"
+          if [ "$NOT_FOUND_STATUS" != "404" ]; then
+            echo "FAILED: Unhandled route returned status $NOT_FOUND_STATUS, expected 404"
+            exit 1
+          fi
+
+          # Test 4: Disallowed HTTP Method (POST /health -> 405 METHOD NOT ALLOWED)
+          echo "--- Test 4: Disallowed HTTP Method (POST /health) ---"
+          METHOD_RESP=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "$BASE_URL/health")
+          METHOD_STATUS=$(echo "$METHOD_RESP" | tail -n1 | sed 's/HTTP_STATUS://')
+          echo "Status: $METHOD_STATUS"
+          if [ "$METHOD_STATUS" != "405" ]; then
+            echo "FAILED: POST /health returned status $METHOD_STATUS, expected 405"
+            exit 1
+          fi
+
+          echo "=== All Live Smoke Tests PASSED Successfully! ==="
+
+      - name: Deployment Traceability Summary
+        env:
+          GIT_SHA: ${{ github.sha }}
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+          IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
+          TASK_DEF_ARN: ${{ needs.deploy-ecs.outputs.task_definition_arn }}
+          TASK_REVISION: ${{ needs.deploy-ecs.outputs.task_revision }}
+          ALB_DNS: ${{ steps.get-alb.outputs.alb_dns }}
+        run: |
+          echo "==========================================================="
+          echo "          END-TO-END DEPLOYMENT TRACEABILITY RECORD        "
+          echo "==========================================================="
+          echo "Git Commit SHA       : $GIT_SHA"
+          echo "ECR Image URI        : $IMAGE_URI"
+          echo "ECR Image Digest     : $IMAGE_DIGEST"
+          echo "ECS Cluster          : ${{ env.ECS_CLUSTER }}"
+          echo "ECS Service          : ${{ env.ECS_SERVICE }}"
+          echo "ECS Task Def ARN     : $TASK_DEF_ARN"
+          echo "ECS Task Def Revision: $TASK_REVISION"
+          echo "ALB DNS Name         : $ALB_DNS"
+          echo "Live Health URL      : http://$ALB_DNS/health"
+          echo "Deployment Status    : SUCCESS"
+          echo "==========================================================="
